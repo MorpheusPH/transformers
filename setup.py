@@ -433,7 +433,7 @@ def get_extensions():
                 # TODO: understand what that is, probably defines the target architecture
                 #  https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#options-for-steering-gpu-code-generation-gpu-architecture
                 # Build for A100
-                extra_compile_args=["-arch=compute_80", "-std=c++17"],
+                extra_compile_args=["-arch=compute_70", "-std=c++17"],
             ),
             CUDAExtension(
                 name="transformers.models.gpt_neox.custom_kernels.fused_attention_cuda",
@@ -441,7 +441,7 @@ def get_extensions():
                 # TODO: understand what that is, probably defines the target architecture
                 #  https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#options-for-steering-gpu-code-generation-gpu-architecture
                 # Build for A100
-                extra_compile_args=["-arch=compute_80", "-std=c++17"],
+                extra_compile_args=["-arch=compute_70", "-std=c++17"],
             ),
         ]
     return extensions
