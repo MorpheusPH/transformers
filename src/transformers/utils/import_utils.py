@@ -29,9 +29,8 @@ from typing import Any
 
 from packaging import version
 
-from transformers.utils.versions import importlib_metadata
-
 from . import logging
+from .versions import importlib_metadata
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -275,9 +274,15 @@ try:
 except importlib_metadata.PackageNotFoundError:
     _decord_availale = False
 
+_jieba_available = importlib.util.find_spec("jieba") is not None
+try:
+    _jieba_version = importlib_metadata.version("jieba")
+    logger.debug(f"Successfully imported jieba version {_jieba_version}")
+except importlib_metadata.PackageNotFoundError:
+    _jieba_available = False
+
 # This is the version of torch required to run torch.fx features and torch.onnx with dictionary inputs.
 TORCH_FX_REQUIRED_VERSION = version.parse("1.10")
-TORCH_ONNX_DICT_INPUTS_MINIMUM_VERSION = version.parse("1.8")
 
 
 def is_kenlm_available():
@@ -389,7 +394,7 @@ def is_torch_tf32_available():
 
 
 torch_version = None
-_torch_fx_available = _torch_onnx_dict_inputs_support_available = False
+_torch_fx_available = False
 if _torch_available:
     torch_version = version.parse(importlib_metadata.version("torch"))
     _torch_fx_available = (torch_version.major, torch_version.minor) >= (
@@ -397,19 +402,17 @@ if _torch_available:
         TORCH_FX_REQUIRED_VERSION.minor,
     )
 
-    _torch_onnx_dict_inputs_support_available = torch_version >= TORCH_ONNX_DICT_INPUTS_MINIMUM_VERSION
-
 
 def is_torch_fx_available():
     return _torch_fx_available
 
 
+def is_peft_available():
+    return importlib.util.find_spec("peft") is not None
+
+
 def is_bs4_available():
     return importlib.util.find_spec("bs4") is not None
-
-
-def is_torch_onnx_dict_inputs_support_available():
-    return _torch_onnx_dict_inputs_support_available
 
 
 def is_tf_available():
@@ -479,6 +482,8 @@ def is_torch_compile_available():
 
     import torch
 
+    # We don't do any version check here to support nighlies marked as 1.14. Ultimately needs to check version against
+    # 2.0 but let's do it later.
     return hasattr(torch, "compile")
 
 
@@ -574,16 +579,33 @@ def is_protobuf_available():
     return importlib.util.find_spec("google.protobuf") is not None
 
 
-def is_accelerate_available():
-    return importlib.util.find_spec("accelerate") is not None
+def is_accelerate_available(check_partial_state=False):
+    accelerate_available = importlib.util.find_spec("accelerate") is not None
+    if accelerate_available:
+        if check_partial_state:
+            return version.parse(importlib_metadata.version("accelerate")) >= version.parse("0.17.0")
+        else:
+            return True
+    else:
+        return False
 
 
 def is_optimum_available():
     return importlib.util.find_spec("optimum") is not None
 
 
+def is_optimum_neuron_available():
+    return importlib.util.find_spec("optimum.neuron") is not None
+
+
 def is_safetensors_available():
-    return importlib.util.find_spec("safetensors") is not None
+    if is_torch_available():
+        if version.parse(_torch_version) >= version.parse("1.10"):
+            return importlib.util.find_spec("safetensors") is not None
+        else:
+            return False
+    else:
+        return importlib.util.find_spec("safetensors") is not None
 
 
 def is_tokenizers_available():
@@ -738,6 +760,10 @@ def is_jumanpp_available():
 
 def is_cython_available():
     return importlib.util.find_spec("pyximport") is not None
+
+
+def is_jieba_available():
+    return _jieba_available
 
 
 # docstyle-ignore
@@ -992,6 +1018,16 @@ DECORD_IMPORT_ERROR = """
 decord`. Please note that you may need to restart your runtime after installation.
 """
 
+CYTHON_IMPORT_ERROR = """
+{0} requires the Cython library but it was not found in your environment. You can install it with pip: `pip install
+Cython`. Please note that you may need to restart your runtime after installation.
+"""
+
+JIEBA_IMPORT_ERROR = """
+{0} requires the jieba library but it was not found in your environment. You can install it with pip: `pip install
+jieba`. Please note that you may need to restart your runtime after installation.
+"""
+
 BACKENDS_MAPPING = OrderedDict(
     [
         ("bs4", (is_bs4_available, BS4_IMPORT_ERROR)),
@@ -1023,6 +1059,8 @@ BACKENDS_MAPPING = OrderedDict(
         ("accelerate", (is_accelerate_available, ACCELERATE_IMPORT_ERROR)),
         ("oneccl_bind_pt", (is_ccl_available, CCL_IMPORT_ERROR)),
         ("decord", (is_decord_available, DECORD_IMPORT_ERROR)),
+        ("cython", (is_cython_available, CYTHON_IMPORT_ERROR)),
+        ("jieba", (is_jieba_available, JIEBA_IMPORT_ERROR)),
     ]
 )
 
@@ -1129,3 +1167,22 @@ class _LazyModule(ModuleType):
 
 class OptionalDependencyNotAvailable(BaseException):
     """Internally used error class for signalling an optional dependency was not found."""
+
+
+def direct_transformers_import(path: str, file="__init__.py") -> ModuleType:
+    """Imports transformers directly
+
+    Args:
+        path (`str`): The path to the source file
+        file (`str`, optional): The file to join with the path. Defaults to "__init__.py".
+
+    Returns:
+        `ModuleType`: The resulting imported module
+    """
+    name = "transformers"
+    location = os.path.join(path, file)
+    spec = importlib.util.spec_from_file_location(name, location, submodule_search_locations=[path])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module = sys.modules[name]
+    return module

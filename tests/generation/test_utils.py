@@ -32,15 +32,15 @@ if is_torch_available():
     from transformers import (
         AutoModelForCausalLM,
         AutoModelForSeq2SeqLM,
+        AutoModelForSpeechSeq2Seq,
+        AutoModelForVision2Seq,
         AutoTokenizer,
         BartForConditionalGeneration,
         BartTokenizer,
         GPT2LMHeadModel,
         GPT2Tokenizer,
         ImageGPTForCausalImageModeling,
-        Speech2TextForConditionalGeneration,
         SpeechEncoderDecoderModel,
-        VisionEncoderDecoderModel,
         top_k_top_p_filtering,
     )
     from transformers.generation import (
@@ -79,14 +79,13 @@ class GenerationTesterMixin:
     all_generative_model_classes = ()
     input_name = "input_ids"
 
-    def _get_input_ids_and_config(self):
+    def _get_input_ids_and_config(self, batch_size=2):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
         input_ids = inputs_dict[self.input_name]
 
         # cut to half length & take max batch_size 3
-        max_batch_size = 2
         sequence_length = input_ids.shape[-1] // 2
-        input_ids = input_ids[:max_batch_size, :sequence_length]
+        input_ids = input_ids[:batch_size, :sequence_length]
 
         # generate max 3 tokens
         max_length = input_ids.shape[-1] + 3
@@ -99,7 +98,7 @@ class GenerationTesterMixin:
         if "transfoxl" in config.__class__.__name__.lower():
             attention_mask = None
         else:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)[:max_batch_size, :sequence_length]
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)[:batch_size, :sequence_length]
 
         return config, input_ids, attention_mask, max_length
 
@@ -1361,13 +1360,8 @@ class GenerationTesterMixin:
             )
 
             # Sample constraints
-            if not input_ids.dtype == torch.float32:
-                min_id = torch.min(input_ids) + 3
-                max_id = torch.max(input_ids)
-            else:
-                # otherwise this throws an error for Speech2TextModel since its inputs are floating points
-                min_id = 3
-                max_id = 100
+            min_id = 3
+            max_id = model.config.vocab_size
             force_tokens = torch.randint(min_id, max_id, (1, 2)).tolist()[0]
             constraints = [
                 PhrasalConstraint(force_tokens),
@@ -1463,15 +1457,115 @@ class GenerationTesterMixin:
             for output in (output_contrastive, output_generate):
                 self._check_outputs(output, input_ids, model.config, use_cache=True)
 
+    def test_assisted_decoding_matches_greedy_search(self):
+        # This test ensures that the assisted generation does not introduce output changes over greedy search.
+        # It breaks the pattern in the tests above, for multiple reasons:
+        # - assisted_decoding, contrarily to the other methods, can't be called on its own (e.g. needs to
+        # prepare the assistant encoder outputs in the main generate body);
+        # - assisted_decoding does not support `use_cache = False`
+        # - assisted_decoding does not support `batch_size > 1`
+
+        for model_class in self.all_generative_model_classes:
+            # won't fix: FSMT and Reformer have a different cache variable type (and format).
+            if any(model_name in model_class.__name__.lower() for model_name in ["fsmt", "reformer"]):
+                return
+            # may fix in the future: the following models fail with assisted decoding, and need model-specific fixes
+            if any(
+                model_name in model_class.__name__.lower()
+                for model_name in ["bigbirdpegasus", "gptbigcode", "led", "mega", "speech2text", "git", "prophetnet"]
+            ):
+                return
+
+            # enable cache
+            config, input_ids, attention_mask, max_length = self._get_input_ids_and_config(batch_size=1)
+
+            # NOTE: assisted generation only works with cache on at the moment.
+            if not hasattr(config, "use_cache"):
+                return
+
+            config.use_cache = True
+            config.is_decoder = True
+            model = model_class(config).to(torch_device).eval()
+            output_greedy = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                num_beams=1,
+                do_sample=False,
+                output_scores=True,
+                output_hidden_states=True,
+                output_attentions=True,
+                return_dict_in_generate=True,
+            )
+            # Note: with assisted generate, if the same model is used as assistant, then all assistant tokens will
+            # be correct
+            output_assisted = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                num_beams=1,
+                do_sample=False,
+                assistant_model=model,
+                output_scores=True,
+                output_hidden_states=True,
+                output_attentions=True,
+                return_dict_in_generate=True,
+            )
+
+            self.assertListEqual(output_greedy.sequences.tolist(), output_assisted.sequences.tolist())
+
+            for output in (output_greedy, output_assisted):
+                self._check_outputs(output, input_ids, model.config, use_cache=True)
+
+    def test_assisted_decoding_sample(self):
+        # Seeded assisted decoding will not match sample for the same seed, as there are >1 sampling steps per output
+        # token. As such, this test only checks that the output format is correct.
+
+        for model_class in self.all_generative_model_classes:
+            # won't fix: FSMT and Reformer have a different cache variable type (and format).
+            if any(model_name in model_class.__name__.lower() for model_name in ["fsmt", "reformer"]):
+                return
+            # may fix in the future: the following models fail with assisted decoding, and need model-specific fixes
+            if any(
+                model_name in model_class.__name__.lower()
+                for model_name in ["bigbirdpegasus", "gptbigcode", "led", "mega", "speech2text", "git", "prophetnet"]
+            ):
+                return
+
+            # enable cache
+            config, input_ids, attention_mask, max_length = self._get_input_ids_and_config(batch_size=1)
+
+            # NOTE: assisted generation only works with cache on at the moment.
+            if not hasattr(config, "use_cache"):
+                return
+
+            config.use_cache = True
+            config.is_decoder = True
+            model = model_class(config).to(torch_device).eval()
+            output_assisted = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                num_beams=1,
+                do_sample=True,
+                assistant_model=model,  # triggers assisted decoding
+                output_scores=True,
+                output_hidden_states=True,
+                output_attentions=True,
+                return_dict_in_generate=True,
+            )
+
+            self._check_outputs(output_assisted, input_ids, model.config, use_cache=True)
+
     def test_generate_with_head_masking(self):
         """Test designed for encoder-decoder models to ensure the attention head masking is used."""
         attention_names = ["encoder_attentions", "decoder_attentions", "cross_attentions"]
         for model_class in self.all_generative_model_classes:
             config, input_ids, attention_mask, max_length = self._get_input_ids_and_config()
-            model = model_class(config).to(torch_device)
             # We want to test only encoder-decoder models
             if not config.is_encoder_decoder:
                 continue
+            model = model_class(config).to(torch_device)
 
             head_masking = {
                 "head_mask": torch.zeros(config.encoder_layers, config.encoder_attention_heads, device=torch_device),
@@ -1485,7 +1579,7 @@ class GenerationTesterMixin:
 
             signature = inspect.signature(model.forward)
             # We want to test only models where encoder/decoder head masking is implemented
-            if not set(head_masking.keys()) < set([*signature.parameters.keys()]):
+            if not set(head_masking.keys()) < {*signature.parameters.keys()}:
                 continue
 
             for attn_name, (name, mask) in zip(attention_names, head_masking.items()):
@@ -1501,6 +1595,54 @@ class GenerationTesterMixin:
                 # We check the state of decoder_attentions and cross_attentions just from the last step
                 attn_weights = out[attn_name] if attn_name == attention_names[0] else out[attn_name][-1]
                 self.assertEqual(sum([w.sum().item() for w in attn_weights]), 0.0)
+
+    # TODO (joao): this test is actually not slow :) However, it is not passing in some models (e.g. GPTNeoX) and the
+    # fix for some models is quite lengthy. Being slow means it doesn't block our push CI while we fix it.
+    @slow
+    def test_left_padding_compatibility(self):
+        # The check done in this test is fairly difficult -- depending on the model architecture, passing the right
+        # position index for the position embeddings can still result in a different output, due to numerical masking.
+        # On the other hand, for some types of position embeddings, an incorrect position index can have a minimal
+        # impact on the output.
+        # There are two tricks employed to check whether left-padding compatibility is in place:
+        # 1 - To reduce the negative impact of the numerical attention mask on a correct position index, we set the
+        # padding size to 1.
+        # 2 - To reduce the chance of false positives (i.e. passing when it should be failing), we run the check
+        # multiple times with random inputs, and it has to pass with all of them.
+        # NOTE: because of 2), there is some chance of false positives in this test.
+
+        for model_class in self.all_generative_model_classes:
+            config, _, _, _ = self._get_input_ids_and_config()
+            if config.is_encoder_decoder:
+                continue  # skip for encoder-decoder models -- they don't need left-padding compatibility
+            model = model_class(config).to(torch_device).eval()
+            signature = inspect.signature(model.forward).parameters.keys()
+
+            no_failures = True
+            for _ in range(10):  # there may be false positives with 10 runs, we rely on the CI to catch the flakiness
+                _, input_ids, attention_mask, _ = self._get_input_ids_and_config()
+                model_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                if "position_ids" in signature:
+                    position_ids = torch.cumsum(attention_mask, dim=-1) - 1
+                    position_ids.masked_fill_(attention_mask == 0, 1)
+                    model_kwargs["position_ids"] = position_ids
+                next_logits_wo_padding = model(**model_kwargs).logits[:, -1, :]
+
+                pad_size = (input_ids.shape[0], 1)
+                padding = torch.ones(pad_size, dtype=input_ids.dtype, device=torch_device) * config.pad_token_id
+                padded_input_ids = torch.cat((padding, input_ids), dim=1)
+                padded_attention_mask = torch.cat((torch.zeros_like(padding), attention_mask), dim=1)
+                model_kwargs = {"input_ids": padded_input_ids, "attention_mask": padded_attention_mask}
+                if "position_ids" in signature:
+                    position_ids = torch.cumsum(padded_attention_mask, dim=-1) - 1
+                    position_ids.masked_fill_(padded_attention_mask == 0, 1)
+                    model_kwargs["position_ids"] = position_ids
+                next_logits_with_padding = model(**model_kwargs).logits[:, -1, :]
+                if not torch.allclose(next_logits_wo_padding, next_logits_with_padding):
+                    no_failures = False
+                    break
+
+            self.assertTrue(no_failures)
 
     def _check_outputs(self, output, input_ids, config, use_cache=False, num_return_sequences=1):
         batch_size, seq_length = input_ids.shape
@@ -1792,10 +1934,13 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
     if is_torch_available():
         framework_dependent_parameters = {
             "AutoModelForCausalLM": AutoModelForCausalLM,
+            "AutoModelForSpeechSeq2Seq": AutoModelForSpeechSeq2Seq,
             "AutoModelForSeq2SeqLM": AutoModelForSeq2SeqLM,
+            "AutoModelForVision2Seq": AutoModelForVision2Seq,
             "LogitsProcessorList": LogitsProcessorList,
             "MinLengthLogitsProcessor": MinLengthLogitsProcessor,
             "create_tensor_fn": torch.tensor,
+            "floats_tensor": floats_tensor,
             "return_tensors": "pt",
         }
 
@@ -1846,8 +1991,10 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         max_length = 20
         input_ids = input_ids.expand(2, -1)
         model_kwargs = bart_model._prepare_encoder_decoder_kwargs_for_generation(input_ids, {})
-        input_ids = bart_model._prepare_decoder_input_ids_for_generation(
-            input_ids.shape[0],
+        input_ids, model_kwargs = bart_model._prepare_decoder_input_ids_for_generation(
+            batch_size=input_ids.shape[0],
+            model_input_name=bart_model.main_input_name,
+            model_kwargs=model_kwargs,
             decoder_start_token_id=bart_model.config.decoder_start_token_id,
             bos_token_id=bart_model.config.bos_token_id,
         )
@@ -1873,8 +2020,10 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         max_length = 20
         input_ids = input_ids.expand(2, -1)
         model_kwargs = bart_model._prepare_encoder_decoder_kwargs_for_generation(input_ids, {})
-        input_ids = bart_model._prepare_decoder_input_ids_for_generation(
-            input_ids.shape[0],
+        input_ids, model_kwargs = bart_model._prepare_decoder_input_ids_for_generation(
+            batch_size=input_ids.shape[0],
+            model_input_name=bart_model.main_input_name,
+            model_kwargs=model_kwargs,
             decoder_start_token_id=bart_model.config.decoder_start_token_id,
             bos_token_id=bart_model.config.bos_token_id,
         )
@@ -1903,8 +2052,10 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
         input_ids = input_ids.expand(2, -1)
         model_kwargs = bart_model._prepare_encoder_decoder_kwargs_for_generation(input_ids, {})
-        input_ids = bart_model._prepare_decoder_input_ids_for_generation(
-            input_ids.shape[0],
+        input_ids, model_kwargs = bart_model._prepare_decoder_input_ids_for_generation(
+            batch_size=input_ids.shape[0],
+            model_input_name=bart_model.main_input_name,
+            model_kwargs=model_kwargs,
             decoder_start_token_id=bart_model.config.decoder_start_token_id,
             bos_token_id=bart_model.config.bos_token_id,
         )
@@ -1936,8 +2087,10 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
         input_ids = input_ids.expand(6, -1)
         model_kwargs = bart_model._prepare_encoder_decoder_kwargs_for_generation(input_ids, {})
-        input_ids = bart_model._prepare_decoder_input_ids_for_generation(
-            input_ids.shape[0],
+        input_ids, model_kwargs = bart_model._prepare_decoder_input_ids_for_generation(
+            batch_size=input_ids.shape[0],
+            model_input_name=bart_model.main_input_name,
+            model_kwargs=model_kwargs,
             decoder_start_token_id=bart_model.config.decoder_start_token_id,
             bos_token_id=bart_model.config.bos_token_id,
         )
@@ -1975,8 +2128,10 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         # Greedy
         input_ids = input_ids.expand(6, -1)
         model_kwargs = bart_model._prepare_encoder_decoder_kwargs_for_generation(input_ids, {})
-        input_ids = bart_model._prepare_decoder_input_ids_for_generation(
-            input_ids.shape[0],
+        input_ids, model_kwargs = bart_model._prepare_decoder_input_ids_for_generation(
+            batch_size=input_ids.shape[0],
+            model_input_name=bart_model.main_input_name,
+            model_kwargs=model_kwargs,
             decoder_start_token_id=bart_model.config.decoder_start_token_id,
             bos_token_id=bart_model.config.bos_token_id,
         )
@@ -2094,43 +2249,8 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         output = generator(prompt, stop_sequence=" number")
         self.assertEqual(output, [{"generated_text": "Hello I believe in in in number"}])
 
-    def test_encoder_decoder_generate_attention_mask(self):
-        articles = ["Timberlake", "Jessica Biel, welcome to parenthood among other things"]
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        # need extrem generation values here to force this test
-        # to fail when `attention_mask` is not correctly treated in generate
-        model = BartForConditionalGeneration.from_pretrained(
-            "hf-internal-testing/tiny-random-bart", max_length=50, num_beams=5, num_return_sequences=5
-        ).to(torch_device)
-
-        model.config.eos_token_id = None
-        input_ids = tokenizer(articles[0], return_tensors="pt").input_ids.to(torch_device)
-        input_ids_batched = tokenizer(articles, padding=True, return_tensors="pt").input_ids.to(torch_device)
-
-        output_sequences_batched = model.generate(
-            input_ids=input_ids_batched, return_dict_in_generate=True, output_scores=True
-        )
-        output_sequences = model.generate(input_ids=input_ids, return_dict_in_generate=True, output_scores=True)
-
-        batched_out = output_sequences_batched.sequences_scores
-        out = output_sequences.sequences_scores
-
-        diff = (batched_out[:5].sum() - out.sum()).abs()
-
-        self.assertTrue(diff < 1e-4)
-
-    def test_generate_input_ids_as_kwarg(self):
-        article = """I need input_ids to generate"""
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2", max_length=15).to(torch_device)
-        input_ids = tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
-        output_sequences_kwargs = model.generate(input_ids=input_ids).cpu()
-        output_sequences = model.generate(input_ids).cpu()
-
-        self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
-        self.assertEqual(output_sequences.shape, (1, 15))
-
     def test_generate_non_nlp_input_ids_as_kwarg(self):
+        # PT-only test: AFAIK there's no non-NLP model architecture in TF that supports `input_ids` as its only input
         model = ImageGPTForCausalImageModeling.from_pretrained(
             "hf-internal-testing/tiny-random-imagegpt", max_length=10
         ).to(torch_device)
@@ -2142,39 +2262,8 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
         self.assertEqual(output_sequences.shape, (3, 10))
 
-    def test_generate_input_ids_as_encoder_kwarg(self):
-        article = """Justin Timberlake and Jessica Biel, welcome to parenthood."""
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained("hf-internal-testing/tiny-random-bart", max_length=5).to(
-            torch_device
-        )
-        model.config.eos_token_id = None
-        input_ids = tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
-        output_sequences_kwargs = model.generate(input_ids=input_ids).cpu()
-        output_sequences = model.generate(input_ids).cpu()
-
-        self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
-        self.assertEqual(output_sequences.shape, (1, 5))
-
-    def test_generate_inputs_and_encoder_kwargs(self):
-        article = """I need input_ids to generate"""
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2", max_length=10).to(torch_device)
-        input_ids = tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
-        with self.assertRaises(ValueError):
-            model.generate(input_ids, input_ids=input_ids)
-
-    def test_generate_too_many_encoder_kwargs(self):
-        article = """I need input_ids to generate"""
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained("hf-internal-testing/tiny-random-bart", max_length=10).to(
-            torch_device
-        )
-        input_ids = tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
-        with self.assertRaises(ValueError):
-            model.generate(input_ids=input_ids, inputs_embeds=input_ids)
-
     def test_generate_input_values_as_encoder_kwarg(self):
+        # PT-only test: AFAIK there's no generate-capable architecture in TF that supports `input_values` as its input
         input_values = floats_tensor((2, 250))
         model = SpeechEncoderDecoderModel.from_pretrained("hf-internal-testing/tiny-random-speech-encoder-decoder")
         model = model.to(torch_device)
@@ -2184,202 +2273,8 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
         self.assertEqual(output_sequences.shape, (2, 5))
 
-    def test_generate_input_features_as_encoder_kwarg(self):
-        input_features = floats_tensor((3, 20, 24))
-        model = Speech2TextForConditionalGeneration.from_pretrained("hf-internal-testing/tiny-random-speech_to_text")
-        model = model.to(torch_device)
-        output_sequences_kwargs = model.generate(input_features=input_features, max_length=5).cpu()
-        output_sequences = model.generate(input_features, max_length=5).cpu()
-
-        self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
-        self.assertEqual(output_sequences.shape, (3, 5))
-
-    def test_generate_pixel_values_as_encoder_kwarg(self):
-        pixel_values = floats_tensor((2, 3, 30, 30))
-        model = VisionEncoderDecoderModel.from_pretrained("hf-internal-testing/tiny-random-vision-encoder-decoder")
-        model = model.to(torch_device)
-        output_sequences_kwargs = model.generate(pixel_values=pixel_values, max_length=5).cpu()
-        output_sequences = model.generate(pixel_values, max_length=5).cpu()
-
-        self.assertListEqual(output_sequences.tolist(), output_sequences_kwargs.tolist())
-        self.assertEqual(output_sequences.shape, (2, 5))
-
-    def test_generate_encoder_outputs_attention_mask(self):
-        input_values = floats_tensor((2, 250)).to(torch_device)
-        attention_mask = torch.ones_like(input_values)
-        model = SpeechEncoderDecoderModel.from_pretrained("hf-internal-testing/tiny-random-speech-encoder-decoder")
-        model = model.to(torch_device)
-
-        encoder = model.get_encoder()
-
-        encoder_outputs = encoder(input_values)
-
-        output_sequences_no_mask = model.generate(encoder_outputs=encoder_outputs).cpu()
-        output_sequences_with_mask = model.generate(encoder_outputs=encoder_outputs, attention_mask=attention_mask)
-        output_sequences_with_mask = output_sequences_with_mask.cpu()
-
-        self.assertListEqual(output_sequences_no_mask.tolist(), output_sequences_with_mask.tolist())
-
-    def test_transition_scores_greedy_search(self):
-        articles = ["Justin Timberlake", "Michael Phelps"]
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=5,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores)
-        expected_scores = np.array(
-            [
-                [0.3596273, 0.39646253, 0.46157718, 0.4594633, 0.44866616],
-                [0.34934354, 0.4935004, 0.6373219, 0.5173545, 0.57517034],
-            ]
-        )
-        self.assertTrue(np.allclose(transition_scores.cpu().numpy(), expected_scores))
-
-    def test_transition_scores_greedy_search_normalized(self):
-        articles = ["Justin Timberlake", "Michael Phelps"]
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=5,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores, normalize_logits=True)
-        expected_scores = np.array(
-            [
-                [-6.5532393, -6.5158753, -6.451863, -6.4527144, -6.459402],
-                [-6.5685124, -6.4277077, -6.282607, -6.399295, -6.340927],
-            ]
-        )
-        self.assertTrue(np.allclose(transition_scores.cpu().numpy(), expected_scores))
-
-    def test_transition_scores_beam_search_encoder_decoder(self):
-        articles = [
-            "Justin Timberlake and Jessica Biel, welcome to parenthood.",
-            "Michael Phelps is arguably the most decorated Olympian of all time.",
-        ]
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained(
-            "hf-internal-testing/tiny-random-bart",
-            max_length=10,
-            num_beams=4,
-            num_return_sequences=2,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_scores=True,
-            length_penalty=0.0,
-        )
-        model = model.to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(input_ids=input_ids)
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores, outputs.beam_indices)
-        transition_scores_sum = transition_scores.sum(-1)
-
-        self.assertTrue(torch.allclose(transition_scores_sum, outputs.sequences_scores, atol=1e-3))
-
-    def test_transition_scores_beam_search_encoder_decoder_with_eos(self):
-        articles = [
-            "Justin Timberlake and Jessica Biel, welcome to parenthood.",
-            "Michael Phelps is arguably the most decorated Olympian of all time.",
-        ]
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained(
-            "hf-internal-testing/tiny-random-bart",
-            max_length=10,
-            num_beams=4,
-            num_return_sequences=2,
-            return_dict_in_generate=True,
-            output_scores=True,
-            length_penalty=0.0,
-        )
-        model = model.to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(input_ids=input_ids)
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores, outputs.beam_indices)
-        transition_scores_sum = transition_scores.sum(-1)
-
-        self.assertTrue(torch.allclose(transition_scores_sum, outputs.sequences_scores, atol=1e-3))
-
-    def test_transition_scores_beam_search_decoder_only(self):
-        articles = [
-            "Justin Timberlake",
-            "Michael Phelps",
-        ]
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-
-        model = GPT2LMHeadModel.from_pretrained(
-            "hf-internal-testing/tiny-random-gpt2",
-            max_length=10,
-            num_beams=4,
-            num_return_sequences=2,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_scores=True,
-            length_penalty=0.0,
-        )
-        model = model.to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(input_ids=input_ids)
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores, outputs.beam_indices)
-        transition_scores_sum = transition_scores.sum(-1)
-
-        self.assertTrue(torch.allclose(transition_scores_sum, outputs.sequences_scores, atol=1e-3))
-
-    def test_transition_scores_beam_sample_encoder_decoder(self):
-        articles = [
-            "Justin Timberlake and Jessica Biel, welcome to parenthood.",
-            "Michael Phelps is arguably the most decorated Olympian of all time.",
-        ]
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained(
-            "hf-internal-testing/tiny-random-bart",
-            do_sample=True,
-            max_length=10,
-            num_beams=4,
-            num_return_sequences=2,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_scores=True,
-            length_penalty=0.0,
-        )
-        model = model.to(torch_device)
-
-        input_ids = tokenizer(articles, return_tensors="pt", padding=True).input_ids.to(torch_device)
-        outputs = model.generate(input_ids=input_ids)
-
-        transition_scores = model.compute_transition_scores(outputs.sequences, outputs.scores, outputs.beam_indices)
-        transition_scores_sum = transition_scores.sum(-1)
-
-        self.assertTrue(torch.allclose(transition_scores_sum, outputs.sequences_scores, atol=1e-3))
-
     def test_transition_scores_group_beam_search_encoder_decoder(self):
+        # PT-only test: TF doesn't have group beam search
         articles = [
             "Justin Timberlake and Jessica Biel, welcome to parenthood.",
             "Michael Phelps is arguably the most decorated Olympian of all time.",
@@ -2407,95 +2302,8 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         self.assertTrue(torch.allclose(transition_scores_sum, outputs.sequences_scores, atol=1e-3))
 
     @slow
-    def test_transition_scores_early_stopping(self):
-        # This is an aggressive test that makes sure that `beam_search's`
-        # transition scores are computed correctly for varying `num_return_sequences`,
-        # `num_beams` and `batch_size > 1`
-        # 2 x input_ids for "question: How are you? \n context: I had a long day, "
-        input_ids = torch.tensor(2 * [[822, 10, 571, 33, 25, 58, 2625, 10, 27, 141, 3, 9, 307, 239, 6, 1]]).to(
-            torch_device
-        )
-
-        model = AutoModelForSeq2SeqLM.from_pretrained("t5-small").to(torch_device)
-
-        result = model.generate(
-            input_ids,
-            max_length=10,
-            return_dict_in_generate=True,
-            output_scores=True,
-            forced_eos_token_id=model.config.eos_token_id,
-            num_beams=4,
-            do_sample=False,
-            num_return_sequences=3,
-            length_penalty=0.0,
-        )
-
-        transition_scores = model.compute_transition_scores(
-            sequences=result.sequences, scores=result.scores, beam_indices=result.beam_indices
-        )
-
-        sum_transition_scores = torch.sum(transition_scores, dim=1)
-
-        self.assertListEqual(sum_transition_scores.cpu().tolist(), result.sequences_scores.cpu().tolist())
-
-    def test_log_scores_sample_decoder_only(self):
-        articles = ["I need input_ids to generate", "Short and"]
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        inputs = tokenizer(articles, return_tensors="pt", padding=True).to(torch_device)
-
-        result = model.generate(
-            **inputs,
-            max_length=15,
-            return_dict_in_generate=True,
-            do_sample=False,
-            output_scores=True,
-        )
-
-        # decoder-only starts generating from `input_ids`
-        begin_generation = inputs.input_ids.shape[-1]
-
-        gen_sequences = result.sequences[:, begin_generation:]
-        probs = torch.stack(result.scores, dim=1).softmax(-1)
-
-        gen_probs = torch.gather(probs, 2, gen_sequences[:, :, None]).squeeze(-1)
-        expected_probs = torch.tensor([[0.0014, 0.0015], [0.0014, 0.0014]])
-
-        self.assertTrue(torch.allclose(gen_probs.cpu(), expected_probs, atol=1e-3))
-
-    def test_log_scores_sample_encoder_decoder(self):
-        articles = ["I need input_ids to generate", "Short and"]
-        tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
-        model = BartForConditionalGeneration.from_pretrained("hf-internal-testing/tiny-random-bart").to(torch_device)
-
-        inputs = tokenizer(articles, return_tensors="pt", padding=True).to(torch_device)
-
-        result = model.generate(
-            **inputs,
-            max_length=3,
-            return_dict_in_generate=True,
-            do_sample=False,
-            num_beams=1,
-            output_scores=True,
-        )
-
-        # encoder-decoder has one decoder_start_token_id by default
-        begin_generation = 1
-
-        gen_sequences = result.sequences[:, begin_generation:]
-        probs = torch.stack(result.scores, dim=1).softmax(-1)
-
-        gen_probs = torch.gather(probs, 2, gen_sequences[:, :, None]).squeeze(-1)
-        expected_probs = torch.tensor([[0.0013, 1.0000], [0.0013, 1.0000]])
-
-        self.assertTrue(torch.allclose(gen_probs.cpu(), expected_probs, atol=1e-3))
-
-    @slow
     def test_beam_search_example_integration(self):
+        # PT-only test: TF doesn't have a BeamSearchScorer
         # exactly the example provided in the docstrings of beam search, which previously
         # failed after directly copying from it. Refer to PR #15555
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
@@ -2538,6 +2346,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
     @slow
     def test_constrained_beam_search(self):
+        # PT-only test: TF doesn't have constrained beam search
         model = GPT2LMHeadModel.from_pretrained("gpt2").to(torch_device)
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
@@ -2575,6 +2384,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
     @slow
     def test_constrained_beam_search_mixed(self):
+        # PT-only test: TF doesn't have constrained beam search
         model = GPT2LMHeadModel.from_pretrained("gpt2").to(torch_device)
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
@@ -2615,6 +2425,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
     @slow
     def test_constrained_beam_search_mixed_mixin(self):
+        # PT-only test: TF doesn't have constrained beam search
         model = GPT2LMHeadModel.from_pretrained("gpt2").to(torch_device)
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
@@ -2652,6 +2463,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
     @slow
     def test_constrained_beam_search_example_translation_mixin(self):
+        # PT-only test: TF doesn't have constrained beam search
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
         model = AutoModelForSeq2SeqLM.from_pretrained("t5-base")
 
@@ -2676,6 +2488,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
 
     @slow
     def test_constrained_beam_search_example_integration(self):
+        # PT-only test: TF doesn't have constrained beam search
         tokenizer = AutoTokenizer.from_pretrained("t5-base")
         model = AutoModelForSeq2SeqLM.from_pretrained("t5-base")
 
@@ -2719,6 +2532,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         self.assertListEqual(outputs, ["Wie alt sind Sie?"])
 
     def test_constrained_beam_search_mixin_type_checks(self):
+        # PT-only test: TF doesn't have constrained beam search
         tokenizer = AutoTokenizer.from_pretrained("patrickvonplaten/t5-tiny-random")
         model = AutoModelForSeq2SeqLM.from_pretrained("patrickvonplaten/t5-tiny-random")
 
@@ -2759,6 +2573,7 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
             model.generate(input_ids, force_words_ids=[[[-1]]])
 
     def test_contrastive_search_batched(self):
+        # PT-only test: TF doesn't have constrained beam search
         # Tests that contrastive search works with batched inputs (i.e. has the same output as for non-batched inputs)
         articles = ["Foo", "Bar Baz"]
         tokenizer = BartTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
@@ -2783,55 +2598,8 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         max_score_diff = (output_sequences_batched.scores[0][1] - output_sequences.scores[0][0]).abs().max()
         self.assertTrue(max_score_diff < 1e-5)
 
-    def test_eos_token_id_int_and_list_greedy_search(self):
-        generation_kwargs = {
-            "do_sample": False,
-            "num_beams": 1,
-        }
-        expectation = 13
-
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        text = """Hello, my dog is cute and"""
-        tokens = tokenizer(text, return_tensors="pt").to(torch_device)
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        torch.manual_seed(0)
-        eos_token_id = 873
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
-        torch.manual_seed(0)
-        eos_token_id = [873]
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
-    def test_eos_token_id_int_and_list_contrastive_search(self):
-        generation_kwargs = {
-            "do_sample": False,
-            "num_beams": 1,
-            "penalty_alpha": 0.6,
-            "top_k": 4,
-        }
-        expectation = 17
-
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        text = """Hello, my dog is cute and"""
-        tokens = tokenizer(text, return_tensors="pt").to(torch_device)
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        torch.manual_seed(0)
-        eos_token_id = 225
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
-        torch.manual_seed(0)
-        eos_token_id = [225]
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
     def test_eos_token_id_int_and_list_top_k_top_sampling(self):
+        # Has TF equivalent: this test relies on random sampling
         generation_kwargs = {
             "do_sample": True,
             "num_beams": 1,
@@ -2839,57 +2607,39 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
             "top_k": 10,
             "temperature": 0.7,
         }
-        expectation = 15
+        expectation = 20
 
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+        tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
         text = """Hello, my dog is cute and"""
         tokens = tokenizer(text, return_tensors="pt").to(torch_device)
+        model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
 
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        torch.manual_seed(0)
+        # Only some seeds will work both on CPU/GPU for a fixed `expectation` value.
+        # The selected seed is not guaranteed to work on all torch versions.
+        torch.manual_seed(1)
         eos_token_id = 846
         generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
         self.assertTrue(expectation == len(generated_tokens[0]))
 
-        torch.manual_seed(0)
-        eos_token_id = [846]
+        torch.manual_seed(1)
+        eos_token_id = [846, 198]
         generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
         self.assertTrue(expectation == len(generated_tokens[0]))
 
-    def test_eos_token_id_int_and_list_beam_search(self):
-        generation_kwargs = {
-            "do_sample": False,
-            "num_beams": 3,
-        }
-        expectation = 13
-
-        tokenizer = GPT2Tokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-        text = """Hello, my dog is cute and"""
-        tokens = tokenizer(text, return_tensors="pt").to(torch_device)
-
-        model = GPT2LMHeadModel.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
-
-        torch.manual_seed(0)
-        eos_token_id = 873
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
-        torch.manual_seed(0)
-        eos_token_id = [873]
-        generated_tokens = model.generate(**tokens, eos_token_id=eos_token_id, **generation_kwargs)
-        self.assertTrue(expectation == len(generated_tokens[0]))
-
-    def test_generate_from_input_embeds_decoder_only(self):
+    def test_generate_from_inputs_embeds_decoder_only(self):
+        # PT-only test: TF doesn't have a model with support to generate from input embeds (yet ;))
         # Note: the model must support generation from input embeddings
-        model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+        model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(torch_device)
         tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-gpt2")
+        model.config.pad_token_id = tokenizer.eos_token_id
 
         text = "Hello world"
-        input_ids = tokenizer.encode(text, return_tensors="pt")
+        tokenized_inputs = tokenizer([text, text], return_tensors="pt")
+        input_ids = tokenized_inputs.input_ids.to(torch_device)
 
         # Traditional way of generating text
         outputs_from_ids = model.generate(input_ids)
+        self.assertEqual(outputs_from_ids.shape, (2, 20))
 
         # Same thing, but from input embeddings
         inputs_embeds = model.transformer.wte(input_ids)
@@ -2902,3 +2652,49 @@ class GenerationIntegrationTests(unittest.TestCase, GenerationIntegrationTestsMi
         outputs_from_rand_embeds = model.generate(input_ids, inputs_embeds=random_embeds)
         with self.assertRaises(AssertionError):
             self.assertListEqual(outputs_from_rand_embeds.tolist(), outputs_from_embeds.tolist())
+
+        # input_ids is not a required input -- if we don't pass it, the newly generated tokens will be the same
+        outputs_from_embeds_wo_ids = model.generate(
+            inputs_embeds=inputs_embeds, max_new_tokens=20 - inputs_embeds.shape[1]
+        )
+        self.assertListEqual(
+            outputs_from_embeds[:, inputs_embeds.shape[1] :].tolist(),
+            outputs_from_embeds_wo_ids[:, 1:].tolist(),
+        )
+
+    def test_model_kwarg_encoder_signature_filtering(self):
+        # Has TF equivalent: ample use of framework-specific code
+        bart_tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-bart")
+        article = """Hugging Face is a technology company based in New York and Paris."""
+        input_ids = bart_tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
+        bart_model = BartForConditionalGeneration.from_pretrained("hf-internal-testing/tiny-random-bart").to(
+            torch_device
+        )
+        output = bart_model.generate(input_ids).cpu().numpy()
+
+        # Let's create a fake model that has a different signature. In particular, this fake model accepts "foo" as an
+        # argument. Because "foo" is not in the encoder signature and doesn't start with "decoder_", it will be part of
+        # the encoder kwargs prior to signature filtering, which would lead to an exception. But filtering kicks in and
+        # saves the day.
+        class FakeBart(BartForConditionalGeneration):
+            def forward(self, input_ids, foo=None, **kwargs):
+                return super().forward(input_ids, **kwargs)
+
+        bart_model = FakeBart.from_pretrained("hf-internal-testing/tiny-random-bart").to(torch_device)
+        fake_output = bart_model.generate(input_ids, foo="bar").cpu().numpy()
+        self.assertTrue(np.array_equal(output, fake_output))
+
+        # Encoder signature filtering only kicks in if it doesn't accept wildcard kwargs. The following test will fail
+        # because it doesn't do signature filtering.
+        class FakeEncoder(bart_model.model.encoder.__class__):
+            def forward(self, input_ids, **kwargs):
+                return super().forward(input_ids, **kwargs)
+
+        fake_encoder = FakeEncoder(bart_model.config, bart_model.model.shared).to(torch_device)
+        bart_model.model.encoder = fake_encoder
+
+        # Normal generation still works (the output will be different because the encoder weights are different)
+        fake_output = bart_model.generate(input_ids).cpu().numpy()
+        with self.assertRaises(TypeError):
+            # FakeEncoder.forward() accepts **kwargs -> no filtering -> type error due to unexpected input "foo"
+            bart_model.generate(input_ids, foo="bar")
